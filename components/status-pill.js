@@ -1,18 +1,37 @@
+import { escapeHtml } from '../lib/escape.js';
 export function updateStatusPill(el, cache) {
   const ok = cache.healthOk;
   const sse = cache.sseStatus;
   let cls = 'off';
   let label = 'Hub offline';
   if (ok && sse === 'connected') {
-    cls = 'ok';
-    label = `Connected · ${cache.latencyMs != null ? cache.latencyMs + 'ms' : 'live'}`;
-  } else if (ok) {
     cls = cache.latencyMs != null && cache.latencyMs > 400 ? 'warn' : 'ok';
-    label = `Connected · ${cache.latencyMs != null ? cache.latencyMs + 'ms' : '?'}`;
+    label = `Connected · ${cache.latencyMs != null ? cache.latencyMs + 'ms' : 'live'}`;
+  } else if (ok && (sse === 'connecting' || sse === 'reconnecting')) {
+    cls = 'warn';
+    label = `SSE connecting… (${cache.latencyMs != null ? cache.latencyMs + 'ms' : 'hub ok'})`;
+  } else if (ok) {
+    cls = 'off';
+    label = `SSE offline · Hub ${cache.latencyMs != null ? cache.latencyMs + 'ms' : 'up'}`;
   }
-  el.className = `pill ${cls}`;
-  el.innerHTML = `<span class="dot ${cls} ${sse === 'connected' ? 'live' : ''}"></span><span>${label}</span>`;
-  el.title = cache.sseDetail ? `SSE: ${cache.sseStatus} — ${cache.sseDetail}` : `SSE: ${sse}`;
+
+  // Animate text change
+  const prev = el.getAttribute('data-label');
+  if (prev && prev !== label) {
+    el.style.opacity = '0';
+    setTimeout(() => {
+      el.className = `pill ${cls}`;
+      el.innerHTML = `<span class="dot ${cls} ${sse === 'connected' ? 'live' : ''}"></span><span>${escapeHtml(label)}</span>`;
+      el.setAttribute('data-label', label);
+      el.style.opacity = '1';
+    }, 150);
+  } else {
+    el.className = `pill ${cls}`;
+    el.innerHTML = `<span class="dot ${cls} ${sse === 'connected' ? 'live' : ''}"></span><span>${escapeHtml(label)}</span>`;
+    el.setAttribute('data-label', label);
+  }
+  el.style.transition = 'opacity .15s ease';
+  el.title = cache.sseDetail ? `SSE: ${escapeHtml(cache.sseStatus)} — ${escapeHtml(cache.sseDetail)}` : `SSE: ${sse}`;
 }
 
 export function updateSseChip(el, cache) {

@@ -1,14 +1,23 @@
-console.info('[ss] sw boot');
-self.addEventListener('error', (e) => console.error('[ss] sw error:', e.message));
-self.addEventListener('unhandledrejection', (e) => console.error('[ss] sw rejection:', String(e.reason)));
-
 import { getSettings, saveSettings } from './lib/storage.js';
 import { api, probeHub, hubFetch } from './lib/api.js';
 import { SseClient } from './lib/sse-client.js';
 import { handleWebRequest, registerWebBridge } from './lib/web-tools.js';
+import { startAmbientCollector } from './lib/web-ambient.js';
+import { getGrants, saveOriginGrant, revokeOriginGrant, getPendingApprovals, resolveApproval } from './lib/consent.js';
+import { getAuditLog, exportAuditLog } from './lib/audit.js';
+import { getTakeoverStatus, resumeTakeover } from './lib/takeover.js';
+import { listJobs, cancelJob } from './lib/jobs.js';
+import { execExtensionDiagnostics } from './lib/web-diag.js';
+import { getThreatState } from './lib/cognitive-transcendental-ext.js';
 import {
-  GUIDE_URL, FALLBACK_GUIDE, HEALTH_ALARM, HEALTH_PERIOD_S, EVENT_LOG_CAP,
+  GUIDE_URL, FALLBACK_GUIDE, HEALTH_ALARM, EVENT_LOG_CAP,
 } from './lib/constants.js';
+
+console.info('[ss] sw boot');
+self.addEventListener('error', (e) => console.error('[ss] sw error:', e.message));
+self.addEventListener('unhandledrejection', (e) => console.error('[ss] sw rejection:', String(e.reason)));
+
+startAmbientCollector();
 
 const cache = {
   healthOk: null,
@@ -33,6 +42,11 @@ function snapshot() {
 
 const sse = new SseClient({
   onEvent: (ev) => {
+    if (ev && ev.type === 'dev_hot_reload') {
+      console.info('[ss] Dev hot reload received from hub. Reloading runtime...');
+      try { chrome.runtime.reload(); } catch {}
+      return;
+    }
     // Web bridge: the hub relays an agent's web_* tool call to us. Execute it
     // against the user's browser and POST the result back — don't chart it
     // as a normal feed event.
@@ -57,9 +71,22 @@ const sse = new SseClient({
 
 async function ensureSse() {
   const s = await getSettings();
-  if (!s.onboardingComplete) return;
-  if (sse.connected || cache.sseStatus === 'connecting') return;
-  sse.start(s.hubUrl, s.token);
+  const isLoopback = /^(https?:\/\/)?(127\.0\.0\.1|localhost)(:\d+)?/i.test(s.hubUrl || '');
+  if (!s.onboardingComplete && !isLoopback) return;
+  if (sse.isUnauthorized) return;
+  const token = s.token || (isLoopback ? 'screensync-local-dev' : '');
+  if (!token) return;
+  const hubUrl = (s.hubUrl || 'http://127.0.0.1:3000').replace('://localhost:', '://127.0.0.1:');
+  // Zombie recovery: the offscreen keep-alive prevents SW recycling, so a
+  // hub restart can leave the stream silently dead while `connected` stays
+  // true. If no bytes arrived within the keepalive window, force-restart.
+  if (sse.stale()) {
+    console.warn('[ss] SSE stale (no keepalive within 90s) — forcing reconnect');
+    sse.start(hubUrl, token);
+    return;
+  }
+  if (sse.connected) return;
+  sse.start(hubUrl, token);
 }
 
 async function pollHealth() {
@@ -69,11 +96,36 @@ async function pollHealth() {
     cache.healthOk = true;
     cache.latencyMs = h.latencyMs;
     cache.lastFrameAt = h.latestFrameAt ?? cache.lastFrameAt;
+    const isLoopback = /^(https?:\/\/)?(127\.0\.0\.1|localhost)(:\d+)?/i.test(s.hubUrl || '');
+    if (isLoopback && (!s.onboardingComplete || !s.token)) {
+      await saveSettings({
+        token: s.token || 'screensync-local-dev',
+        onboardingComplete: true,
+      });
+      await ensureSse();
+      await registerWebBridge();
+    }
   } catch {
     cache.healthOk = false;
     cache.latencyMs = null;
   }
   broadcast({ kind: 'health', cache });
+}
+
+async function ensureOffscreenDoc() {
+  if (!chrome.offscreen || !chrome.offscreen.createDocument) return false;
+  try {
+    if (chrome.offscreen.hasDocument && (await chrome.offscreen.hasDocument())) return true;
+    await chrome.offscreen.createDocument({
+      url: 'pages/offscreen.html',
+      reasons: ['BLOBS'],
+      justification: 'Keep background service worker active and perform canvas diffing',
+    });
+    return true;
+  } catch (e) {
+    if (String(e).includes('Only a single offscreen')) return true;
+    return false;
+  }
 }
 
 chrome.alarms.create(HEALTH_ALARM, { periodInMinutes: 0.5 });
@@ -82,20 +134,140 @@ chrome.alarms.onAlarm.addListener(async (a) => {
   await pollHealth();
   await ensureSse(); // revive SSE if the SW was terminated
   await registerWebBridge(); // keeps web-bridge presence fresh on the hub
+  await ensureOffscreenDoc();
 });
 
+if (chrome.tabs && chrome.tabs.onActivated) {
+  chrome.tabs.onActivated.addListener(async () => {
+    await ensureSse();
+    await registerWebBridge();
+    await ensureOffscreenDoc();
+  });
+}
+if (chrome.tabs && chrome.tabs.onUpdated) {
+  chrome.tabs.onUpdated.addListener(async (_tabId, changeInfo) => {
+    if (changeInfo.status === 'complete') {
+      await ensureSse();
+      await registerWebBridge();
+      await ensureOffscreenDoc();
+    }
+  });
+}
+
+ensureOffscreenDoc().catch(() => {});
+
+function setupContextMenus() {
+  if (!chrome.contextMenus) return;
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: 'screensync-root',
+      title: 'ScreenSync MCP',
+      contexts: ['all'],
+    });
+    chrome.contextMenus.create({
+      id: 'screensync-send-phone',
+      parentId: 'screensync-root',
+      title: 'Send text to Phone (Type)',
+      contexts: ['selection'],
+    });
+    chrome.contextMenus.create({
+      id: 'screensync-open-phone',
+      parentId: 'screensync-root',
+      title: 'Open link on Phone',
+      contexts: ['link'],
+    });
+    chrome.contextMenus.create({
+      id: 'screensync-sidepanel',
+      parentId: 'screensync-root',
+      title: 'Open ScreenSync Side Panel',
+      contexts: ['page', 'action'],
+    });
+  });
+}
+
+if (chrome.contextMenus && chrome.contextMenus.onClicked) {
+  chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+    try {
+      if (info.menuItemId === 'screensync-send-phone' && info.selectionText) {
+        await api.control('type', { text: info.selectionText });
+      } else if (info.menuItemId === 'screensync-open-phone' && info.linkUrl) {
+        await api.control('open_url', { url: info.linkUrl });
+      } else if (info.menuItemId === 'screensync-sidepanel') {
+        if (chrome.sidePanel && chrome.sidePanel.open && tab) {
+          chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {
+            chrome.tabs.create({ url: chrome.runtime.getURL('pages/dashboard.html') });
+          });
+        } else {
+          chrome.tabs.create({ url: chrome.runtime.getURL('pages/dashboard.html') });
+        }
+      }
+    } catch (e) {
+      console.warn('[ss] contextMenu action failed:', e);
+    }
+  });
+}
+
+if (chrome.commands && chrome.commands.onCommand) {
+  chrome.commands.onCommand.addListener(async (cmd) => {
+    if (cmd === 'toggle-web-access') {
+      const s = await getSettings();
+      const next = !s.webAccessEnabled;
+      const updated = await saveSettings({ webAccessEnabled: next });
+      await registerWebBridge();
+      broadcast({ kind: 'settings', settings: updated });
+    } else if (cmd === 'open-side-panel') {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (tab && chrome.sidePanel && chrome.sidePanel.open) {
+          // Await, so a rejection is caught here instead of becoming an unhandled
+          // promise rejection that silently drops the keyboard shortcut.
+          await chrome.sidePanel.open({ windowId: tab.windowId });
+        } else {
+          chrome.tabs.create({ url: chrome.runtime.getURL('pages/dashboard.html') });
+        }
+      } catch (e) {
+        console.warn('[ss] open sidepanel command failed, opening dashboard tab:', e);
+        chrome.tabs.create({ url: chrome.runtime.getURL('pages/dashboard.html') });
+      }
+    }
+  });
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
+  setupContextMenus();
+  if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
+    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
+  }
+  await boot();
   const s = await getSettings();
   if (!s.onboardingComplete) {
     chrome.tabs.create({ url: chrome.runtime.getURL('pages/onboarding.html') });
   }
 });
 
+let isBooting = false;
+async function boot() {
+  if (isBooting) return;
+  isBooting = true;
+  try {
+    await pollHealth();
+    await ensureSse();
+    await registerWebBridge();
+    await ensureOffscreenDoc();
+  } catch (e) {
+    console.warn('[ss] boot error:', e.message);
+  } finally {
+    isBooting = false;
+  }
+}
+
 chrome.runtime.onStartup.addListener(() => {
-  pollHealth();
-  ensureSse();
-  registerWebBridge();
+  setupContextMenus();
+  boot();
 });
+
+// Immediate boot connection whenever SW initializes
+boot().catch(() => {});
 
 chrome.runtime.onConnect.addListener((port) => {
   ports.add(port);
@@ -104,6 +276,18 @@ chrome.runtime.onConnect.addListener((port) => {
     try { port.postMessage({ kind: 'snapshot', cache, settings }); } catch { /* closed */ }
   });
 });
+
+if (chrome.tabs && chrome.tabs.onRemoved) {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    console.info('[ss] tab closed:', tabId);
+  });
+}
+
+if (chrome.tabs && chrome.tabs.onReplaced) {
+  chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+    console.info('[ss] tab replaced:', removedTabId, '->', addedTabId);
+  });
+}
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
@@ -141,7 +325,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           sse.stop();
           await ensureSse();
           pollHealth();
-          registerWebBridge();
+          await registerWebBridge();
           broadcast({ kind: 'settings', settings });
           sendResponse({ ok: true, settings });
           break;
@@ -175,6 +359,56 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           }
           break;
         }
+        case 'test-hub': {
+          const testUrl = msg.url || (await getSettings()).hubUrl;
+          const testToken = msg.token !== undefined ? msg.token : (await getSettings()).token;
+          try {
+            const res = await hubFetch('/api/web/status', {
+              method: 'GET',
+              url: testUrl,
+              token: testToken,
+              timeoutMs: 4000,
+            });
+            sendResponse({ ok: true, result: res });
+          } catch (e) {
+            sendResponse({ ok: false, error: e.message, status: e.status });
+          }
+          break;
+        }
+        case 'get-grants': {
+          const grants = await getGrants();
+          sendResponse({ ok: true, grants });
+          break;
+        }
+        case 'set-grant': {
+          const grant = await saveOriginGrant(msg.origin, msg.grant || {});
+          sendResponse({ ok: true, origin: msg.origin, grant });
+          break;
+        }
+        case 'revoke-grant': {
+          const res = await revokeOriginGrant(msg.origin);
+          sendResponse({ ok: true, ...res });
+          break;
+        }
+        case 'get-approvals': {
+          sendResponse({ ok: true, approvals: getPendingApprovals() });
+          break;
+        }
+        case 'resolve-approval': {
+          const res = resolveApproval(msg.id, !!msg.approved);
+          sendResponse(res);
+          break;
+        }
+        case 'get-audit-log': {
+          const log = await getAuditLog(msg.args || {});
+          sendResponse(log);
+          break;
+        }
+        case 'export-audit-log': {
+          const exp = await exportAuditLog();
+          sendResponse(exp);
+          break;
+        }
         case 'get-guide': {
           const s = await getSettings();
           const GUIDE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -190,16 +424,63 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             const res = await fetch(GUIDE_URL, { cache: 'no-store' });
             if (!res.ok) throw new Error(`guide ${res.status}`);
             const guide = await res.json();
-            saveSettings({ setupGuideCache: guide, setupGuideFetchedAt: new Date().toISOString() });
+            await saveSettings({ setupGuideCache: guide, setupGuideFetchedAt: new Date().toISOString() });
             sendResponse({ ok: true, guide, cached: false });
           } catch {
             sendResponse({ ok: true, guide: cached || FALLBACK_GUIDE, cached: true, fallback: !cached });
           }
           break;
         }
+        case 'reload-extension':
+          sendResponse({ ok: true, reloading: true });
+          setTimeout(() => {
+            try { chrome.runtime.reload(); } catch {}
+          }, 150);
+          break;
         case 'open-dashboard':
           chrome.tabs.create({ url: chrome.runtime.getURL('pages/dashboard.html') });
           sendResponse({ ok: true });
+          break;
+        case 'open-side-panel': {
+          try {
+            const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+            if (tab && chrome.sidePanel && chrome.sidePanel.open) {
+              await chrome.sidePanel.open({ windowId: tab.windowId });
+              sendResponse({ ok: true });
+            } else {
+              chrome.tabs.create({ url: chrome.runtime.getURL('pages/dashboard.html') });
+              sendResponse({ ok: true, fallback: true });
+            }
+          } catch (err) {
+            // sidePanel.open() needs a live user gesture; a message hop from the popup
+            // does not carry one, so this can legitimately reject. Never fail silently.
+            chrome.tabs.create({ url: chrome.runtime.getURL('pages/dashboard.html') });
+            sendResponse({ ok: false, fallback: true, error: String((err && err.message) || err) });
+          }
+          break;
+        }
+        case 'offscreen-ping':
+          await ensureSse();
+          await registerWebBridge();
+          sendResponse({ ok: true, pong: Date.now() });
+          break;
+        case 'get-takeover':
+          sendResponse({ ok: true, takeover: getTakeoverStatus() });
+          break;
+        case 'resume-takeover':
+          sendResponse(resumeTakeover(msg));
+          break;
+        case 'get-jobs':
+          sendResponse({ ok: true, jobs: listJobs() });
+          break;
+        case 'cancel-job':
+          sendResponse(cancelJob(msg.id));
+          break;
+        case 'get-diagnostics':
+          sendResponse(await execExtensionDiagnostics());
+          break;
+        case 'get-threat-state':
+          sendResponse({ ok: true, threats: getThreatState(msg.domain) });
           break;
         default:
           sendResponse({ ok: false, error: `unknown message ${msg.type}` });
@@ -211,7 +492,27 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true; // async response
 });
 
-// Boot.
-pollHealth();
-ensureSse();
-registerWebBridge();
+if (chrome.runtime.onMessageExternal) {
+  chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+    (async () => {
+      try {
+        console.info('[ss] external message received:', msg, 'from:', sender?.url);
+        await pollHealth();
+        await ensureSse();
+        await registerWebBridge();
+        await ensureOffscreenDoc();
+        if (msg && msg.type === 'reload') {
+          sendResponse({ ok: true, reloading: true });
+          setTimeout(() => {
+            try { chrome.runtime.reload(); } catch {}
+          }, 150);
+          return;
+        }
+        sendResponse({ ok: true, pong: Date.now() });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  });
+}
