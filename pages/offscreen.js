@@ -180,7 +180,10 @@ async function videoHandleStop() {
   }
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Only the service worker drives this page. Anything that comes from a tab always has a sender.tab, and
+  // must not reach the clipboard or the recorder through here.
+  if (!sender || sender.id !== chrome.runtime.id || sender.tab) return false;
   if (msg && msg.type === 'pixel-diff') {
     computePixelDiff(msg).then(sendResponse);
     return true;
